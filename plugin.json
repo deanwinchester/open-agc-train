@@ -1,0 +1,26 @@
+{
+  "name": "open-agc-train",
+  "version": "1.0.0",
+  "description": "模型训练、微调、PPL评估与Benchmark测评",
+  "author": "Open-AGC",
+  "python_module": "open_agc_train",
+  "menu": {
+    "section": "training",
+    "label": "模型训练",
+    "icon": "🎓",
+    "views": [
+      {"id": "training-designer", "label": "模型设计器"},
+      {"id": "training-datasets", "label": "数据集管理"},
+      {"id": "training-scratch", "label": "从头训练"},
+      {"id": "training-finetune", "label": "模型微调"},
+      {"id": "training-monitor", "label": "训练监控"},
+      {"id": "training-benchmark", "label": "模型测评"}
+    ]
+  },
+  "dependencies": ["torch", "transformers", "peft", "accelerate", "datasets"],
+  "optional_dependencies": {
+    "gpu": ["bitsandbytes"],
+    "eval": ["nltk"],
+    "mamba": ["mamba-ssm"]
+  }
+}
