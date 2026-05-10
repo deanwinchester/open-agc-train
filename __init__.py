@@ -78,6 +78,7 @@ def init_plugin(context):
     return PluginInstance(
         name=context.name,
         router=router,
+        router_prefix="/api/training",
         static_dir=static_dir,
         state={
             "engine": engine,

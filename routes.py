@@ -74,7 +74,13 @@ def create_router(db_path: str, engine, broadcast_fn, server_config: dict):
     # ── Training status (health check) ──
     @router.get("/status")
     async def training_status():
-        return {"status": "ok", "plugin": "open-agc-train", "version": "1.0.0"}
+        avail = engine.is_available()
+        return {
+            "available": avail,
+            "import_error": "" if avail else "训练依赖未安装（需 torch, transformers, peft）",
+            "install_state": {"active": False, "stage": "idle", "label": "", "progress": 0},
+            "plugin": "open-agc-train",
+        }
 
     return router
 
@@ -415,6 +421,59 @@ def _register_training_endpoints(router, db_path, engine, broadcast_fn, server_c
         conn.close()
         return {"datasets": [dict(r) for r in rows]}
 
+    @router.get("/base-models")
+    async def list_base_models():
+        """List available GGUF + HuggingFace-cached models for fine-tuning."""
+        models = []
+        # Scan local GGUF files
+        models_dir = os.path.join(os.path.dirname(db_path), "models")
+        if os.path.isdir(models_dir):
+            for fname in sorted(os.listdir(models_dir)):
+                if fname.endswith(".gguf"):
+                    models.append({"id": fname, "name": fname, "source": "gguf"})
+        # Add common HF models as presets
+        presets = [
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+            "Qwen/Qwen2.5-7B-Instruct",
+            "meta-llama/Llama-3.2-1B-Instruct",
+            "meta-llama/Llama-3.2-3B-Instruct",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+            "google/gemma-2-2b-it",
+            "microsoft/Phi-3-mini-4k-instruct",
+        ]
+        for m in presets:
+            models.append({"id": m, "name": m.split("/")[-1], "source": "huggingface"})
+        return {"models": models}
+
+    @router.post("/datasets/scan-import")
+    async def scan_import_datasets():
+        """Auto-detect datasets in the datasets directory and import them."""
+        ds_dir = os.path.join(os.path.dirname(db_path), "datasets")
+        imported = 0
+        if os.path.isdir(ds_dir):
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            for fname in os.listdir(ds_dir):
+                if fname.endswith((".jsonl", ".json", ".txt")):
+                    fpath = os.path.join(ds_dir, fname)
+                    cursor.execute("SELECT id FROM datasets WHERE source_path=?", (fpath,))
+                    if cursor.fetchone():
+                        continue
+                    # Count lines
+                    count = 0
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for _ in f:
+                            count += 1
+                    name = os.path.splitext(fname)[0]
+                    cursor.execute(
+                        "INSERT INTO datasets (name, source, source_path, storage_path, sample_count) VALUES (?,?,?,?,?)",
+                        (name, "auto_scan", fpath, fpath, count))
+                    imported += 1
+            conn.commit()
+            conn.close()
+        return {"status": "success", "imported": imported}
+
     @router.get("/datasets/{ds_id}")
     async def get_dataset(ds_id: int):
         conn = sqlite3.connect(db_path)
@@ -454,6 +513,74 @@ def _register_training_endpoints(router, db_path, engine, broadcast_fn, server_c
         cursor.execute("DELETE FROM datasets WHERE id=?", (ds_id,))
         conn.commit(); conn.close()
         return {"status": "success"}
+
+    # ── Dataset Upload & Creation ──
+    class CreateDatasetRequest(BaseModel):
+        name: str
+        samples: str = ""   # JSONL content from editor
+        format: str = "jsonl"
+
+    @router.post("/datasets/upload")
+    async def upload_dataset(file: UploadFile = File(...), name: str = Form("")):
+        ds_dir = os.path.join(os.path.dirname(db_path), "datasets")
+        os.makedirs(ds_dir, exist_ok=True)
+        fname = file.filename or "dataset.jsonl"
+        fpath = os.path.join(ds_dir, fname)
+        content = await file.read()
+        with open(fpath, "wb") as f:
+            f.write(content)
+        # Count lines
+        count = 0
+        with open(fpath, "r", encoding="utf-8") as f:
+            for _ in f:
+                count += 1
+        ds_name = name or os.path.splitext(fname)[0]
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO datasets (name, source, source_path, storage_path, sample_count) VALUES (?,?,?,?,?)",
+            (ds_name, "upload", fpath, fpath, count))
+        ds_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return {"status": "success", "id": ds_id, "sample_count": count}
+
+    @router.put("/datasets/{ds_id}")
+    async def update_dataset(ds_id: int, req: CreateDatasetRequest):
+        ds_dir = os.path.join(os.path.dirname(db_path), "datasets")
+        os.makedirs(ds_dir, exist_ok=True)
+        fname = f"{req.name}.jsonl"
+        fpath = os.path.join(ds_dir, fname)
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(req.samples)
+        count = len([l for l in req.samples.split("\n") if l.strip()])
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE datasets SET name=?, source_path=?, storage_path=?, sample_count=?, format=? WHERE id=?",
+            (req.name, fpath, fpath, count, req.format, ds_id))
+        conn.commit()
+        conn.close()
+        return {"status": "success", "sample_count": count}
+
+    @router.post("/datasets/create")
+    async def create_dataset(req: CreateDatasetRequest):
+        ds_dir = os.path.join(os.path.dirname(db_path), "datasets")
+        os.makedirs(ds_dir, exist_ok=True)
+        fname = f"{req.name}.jsonl"
+        fpath = os.path.join(ds_dir, fname)
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(req.samples)
+        count = len([l for l in req.samples.split("\n") if l.strip()])
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO datasets (name, source, source_path, storage_path, sample_count, format) VALUES (?,?,?,?,?,?)",
+            (req.name, "manual", fpath, fpath, count, req.format))
+        ds_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return {"status": "success", "id": ds_id, "sample_count": count}
 
     # ── Recommendations ──
     @router.get("/recommended-datasets")
