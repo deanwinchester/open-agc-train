@@ -61,7 +61,7 @@ def init_plugin(context):
         init_benchmark_routes(
             db_path=db_path,
             download_state={},
-            install_state={},
+            install_state={"active": False, "stage": "idle", "label": "", "progress": 0, "error": ""},
             broadcast_fn=context.broadcast_fn,
             get_engine=lambda: engine,
             get_llamacpp=get_llamacpp,
