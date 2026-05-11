@@ -69,13 +69,19 @@ def create_router(db_path: str, engine, broadcast_fn, server_config: dict):
         get_benchmark_detail,
         get_checkpoint_status,
         run_benchmark,
+        delete_benchmark,
+        preview_benchmark_dataset,
+        cancel_benchmark,
     )
     router.add_api_route("/all-models", list_all_models, methods=["GET"], tags=["benchmark"])
     router.add_api_route("/benchmark/cache-status", get_benchmark_cache_status, methods=["GET"], tags=["benchmark"])
     router.add_api_route("/benchmark/pre-download", pre_download_benchmark, methods=["POST"], tags=["benchmark"])
+    router.add_api_route("/benchmark/preview/{benchmark_type}", preview_benchmark_dataset, methods=["GET"], tags=["benchmark"])
     router.add_api_route("/benchmarks", list_benchmarks, methods=["GET"], tags=["benchmark"])
     router.add_api_route("/benchmarks/{bench_id}", get_benchmark_detail, methods=["GET"], tags=["benchmark"])
+    router.add_api_route("/benchmarks/{bench_id}", delete_benchmark, methods=["DELETE"], tags=["benchmark"])
     router.add_api_route("/benchmark/checkpoint-status", get_checkpoint_status, methods=["GET"], tags=["benchmark"])
+    router.add_api_route("/benchmark/cancel", cancel_benchmark, methods=["POST"], tags=["benchmark"])
     router.add_api_route("/benchmark", run_benchmark, methods=["POST"], tags=["benchmark"])
 
     # ── Plugin-specific endpoints (PPL, eval) ──
@@ -349,7 +355,7 @@ def _register_training_endpoints(router, db_path, engine, broadcast_fn, server_c
         name: str
         model_config_id: Optional[int] = None
         dataset_id: Optional[int] = None
-        base_model_id: str = ""
+        base_model_id: Optional[str] = ""
         base_model_source: str = "huggingface"
         training_params_json: str = "{}"
         val_ratio: float = 0.1
@@ -405,7 +411,54 @@ def _register_training_endpoints(router, db_path, engine, broadcast_fn, server_c
         conn.commit(); conn.close()
         return {"status": "success"}
 
-    # ── Training Run Control ──
+    # ── Test trained model chat ──
+    class TestModelRequest(BaseModel):
+        prompt: str
+        max_length: int = 200
+        temperature: float = 0.7
+
+    @router.post("/runs/{run_id}/test-chat")
+    async def test_trained_model(run_id: int, req: TestModelRequest):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT checkpoint_dir FROM training_runs WHERE id=? AND status IN ('completed','aborted_saved')", (run_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row or not row["checkpoint_dir"]:
+            raise HTTPException(status_code=404, detail="训练好的模型尚未保存或不存在")
+        save_dir = row["checkpoint_dir"]
+        if not os.path.isdir(save_dir):
+            raise HTTPException(status_code=404, detail=f"模型目录不存在: {save_dir}")
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(save_dir)
+            model = AutoModelForCausalLM.from_pretrained(
+                save_dir,
+                device_map="auto" if torch.cuda.is_available() else None,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            )
+            inputs = tokenizer(req.prompt, return_tensors="pt")
+            if torch.cuda.is_available():
+                inputs = {k: v.to("cuda") for k, v in inputs.items()}
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=req.max_length,
+                temperature=req.temperature,
+                do_sample=req.temperature > 0,
+                pad_token_id=tokenizer.eos_token_id
+            )
+            text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            if text.startswith(req.prompt):
+                text = text[len(req.prompt):].strip()
+            return {"response": text}
+        except ImportError:
+            raise HTTPException(status_code=500, detail="需要安装 torch 和 transformers 才能测试模型")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"模型推理失败: {str(e)}")
+
+    # ── Training Run Control (wildcard action — must be after specific routes) ──
     @router.post("/runs/{run_id}/{action}")
     async def control_training_run(run_id: int, action: str):
         state = engine.get_state()
@@ -436,15 +489,42 @@ def _register_training_endpoints(router, db_path, engine, broadcast_fn, server_c
 
     @router.get("/base-models")
     async def list_base_models():
-        """List available GGUF + HuggingFace-cached models for fine-tuning."""
+        """List available GGUF + trained models + HF presets for fine-tuning."""
         models = []
-        # Scan local GGUF files
-        models_dir = os.path.join(os.path.dirname(db_path), "models")
-        if os.path.isdir(models_dir):
-            for fname in sorted(os.listdir(models_dir)):
-                if fname.endswith(".gguf"):
-                    models.append({"id": fname, "name": fname, "source": "gguf"})
-        # Add common HF models as presets
+        seen = set()
+
+        def add(mid, name, source):
+            if mid not in seen:
+                seen.add(mid)
+                models.append({"id": mid, "name": name, "source": source})
+
+        # GGUF models via llama.cpp manager (scans main app's models dir)
+        try:
+            lm = get_llamacpp_manager()
+            if lm:
+                for fname in lm.list_models():
+                    add(f"llamacpp/{fname}", fname, "gguf")
+        except Exception:
+            pass
+
+        # Completed training runs with checkpoints
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, name, checkpoint_dir FROM training_runs "
+                "WHERE status IN ('completed','aborted_saved') AND checkpoint_dir IS NOT NULL "
+                "ORDER BY updated_at DESC"
+            )
+            for row in cur.fetchall():
+                if row["checkpoint_dir"] and os.path.isdir(row["checkpoint_dir"]):
+                    add(f"trained/run_{row['id']}", f"{row['name']} (训练模型)", "trained")
+            conn.close()
+        except Exception:
+            pass
+
+        # HF presets
         presets = [
             "Qwen/Qwen2.5-0.5B-Instruct",
             "Qwen/Qwen2.5-1.5B-Instruct",
@@ -456,7 +536,8 @@ def _register_training_endpoints(router, db_path, engine, broadcast_fn, server_c
             "microsoft/Phi-3-mini-4k-instruct",
         ]
         for m in presets:
-            models.append({"id": m, "name": m.split("/")[-1], "source": "huggingface"})
+            add(m, m.split("/")[-1], "huggingface")
+
         return {"models": models}
 
     @router.post("/datasets/scan-import")
@@ -603,10 +684,14 @@ def _register_training_endpoints(router, db_path, engine, broadcast_fn, server_c
 
 # ── Shared constants ──
 RECOMMENDED_DATASETS = [
-    {"repo_id": "fuguowen/alpaca_zh", "name": "Alpaca 中文指令", "desc": "中文指令微调数据集", "size": "~50MB", "splits": ["train"]},
-    {"repo_id": "tatsu-lab/alpaca", "name": "Alpaca 英文指令", "desc": "经典英文指令微调数据集", "size": "~25MB", "splits": ["train"]},
+    {"repo_id": "fuguowen/alpaca_zh", "name": "Alpaca 中文指令", "desc": "中文指令微调数据集，约4.8万条", "size": "~50MB", "splits": ["train"]},
+    {"repo_id": "tatsu-lab/alpaca", "name": "Alpaca 英文指令 (52K)", "desc": "经典英文指令微调数据集", "size": "~25MB", "splits": ["train"]},
     {"repo_id": "databricks/databricks-dolly-15k", "name": "Dolly 15K", "desc": "Databricks 通用指令数据集", "size": "~10MB", "splits": ["train"]},
+    {"repo_id": "Open-Orca/OpenOrca", "name": "OpenOrca", "desc": "大规模推理链微调数据", "size": "~800MB", "splits": ["train"]},
+    {"repo_id": "Open-Orca/SlimOrca", "name": "SlimOrca", "desc": "精简版推理链数据集", "size": "~200MB", "splits": ["train"]},
+    {"repo_id": "HuggingFaceH4/ultrachat_200k", "name": "UltraChat 200K", "desc": "多轮对话微调数据", "size": "~1.5GB", "splits": ["train_sft", "test_sft"]},
     {"repo_id": "Salesforce/wikitext", "name": "WikiText-103", "desc": "语言建模基准数据集", "size": "~180MB", "splits": ["train","validation","test"], "config": "wikitext-103-raw-v1"},
+    {"repo_id": "cnn_dailymail", "name": "CNN/DailyMail", "desc": "新闻摘要数据集", "size": "~550MB", "splits": ["train","validation","test"], "config": "3.0.0"},
 ]
 
 

@@ -19,9 +19,19 @@ def init_plugin(context):
     from core.plugin_manager import PluginInstance
 
     # ── Database setup ──
-    from .db import init_db
+    from .db import init_db, migrate_from
     db_path = os.path.join(context.db_dir, "training.db")
     init_db(db_path)
+
+    # Migrate data from legacy chat_history.db (pre-plugin data)
+    try:
+        legacy_db = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "chat_history.db")
+        if os.path.exists(legacy_db):
+            counts = migrate_from(legacy_db, db_path)
+            if counts:
+                context.logger(f"[train] Migrated from legacy DB: {counts}")
+    except Exception as e:
+        context.logger(f"[train] Migration skipped: {e}")
 
     # ── Import engine (with adapted paths) ──
     # Inject plugin_dir into path for internal imports

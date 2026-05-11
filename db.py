@@ -27,7 +27,12 @@ CREATE TABLE IF NOT EXISTS datasets (
     storage_path    TEXT NOT NULL,
     format          TEXT DEFAULT 'jsonl',
     sample_count    INTEGER DEFAULT 0,
-    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+    statistics_json TEXT,
+    train_split     REAL DEFAULT 0.8,
+    val_split       REAL DEFAULT 0.1,
+    test_split      REAL DEFAULT 0.1,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS training_runs (
@@ -74,6 +79,7 @@ CREATE TABLE IF NOT EXISTS benchmark_results (
     num_questions   INTEGER DEFAULT 0,
     avg_latency_ms  REAL DEFAULT 0,
     tokens_per_second REAL DEFAULT 0,
+    status          TEXT DEFAULT 'completed',
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -106,7 +112,25 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
     conn.commit()
+
+    # Add missing columns to existing tables (schema migration)
+    _add_column(conn, "datasets", "statistics_json", "TEXT")
+    _add_column(conn, "datasets", "train_split", "REAL DEFAULT 0.8")
+    _add_column(conn, "datasets", "val_split", "REAL DEFAULT 0.1")
+    _add_column(conn, "datasets", "test_split", "REAL DEFAULT 0.1")
+    _add_column(conn, "datasets", "updated_at", "DATETIME DEFAULT CURRENT_TIMESTAMP")
+    _add_column(conn, "benchmark_results", "status", "TEXT DEFAULT 'completed'")
+    conn.commit()
+
     return conn
+
+
+def _add_column(conn, table, column, col_def):
+    """Add a column if it doesn't exist (SQLite has no IF NOT EXISTS for ALTER)."""
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+    except Exception:
+        pass
 
 
 def migrate_from(legacy_db_path: str, new_db_path: str) -> dict:
@@ -131,20 +155,28 @@ def migrate_from(legacy_db_path: str, new_db_path: str) -> dict:
             if not rows:
                 counts[table] = 0
                 continue
-            columns = [c[1] for c in legacy_conn.execute(
-                f"PRAGMA table_info({table})").fetchall()]
-            placeholders = ",".join(["?"] * len(columns))
-            col_names = ",".join(columns)
+            # Use only columns that exist in BOTH databases
+            legacy_cols = legacy_conn.execute(f"PRAGMA table_info({table})").fetchall()
+            new_cols = new_conn.execute(f"PRAGMA table_info({table})").fetchall()
+            new_col_names = {c[1] for c in new_cols}
+            common_cols = [c[1] for c in legacy_cols if c[1] in new_col_names]
+            if not common_cols:
+                counts[table] = 0
+                continue
+            placeholders = ",".join(["?"] * len(common_cols))
+            col_names = ",".join(common_cols)
+            migrated = 0
             for row in rows:
-                values = [row[c] for c in columns]
+                values = [row[c] for c in common_cols]
                 try:
                     new_conn.execute(
                         f"INSERT OR IGNORE INTO {table} ({col_names}) VALUES ({placeholders})",
                         values)
+                    migrated += 1
                 except Exception:
                     pass
             new_conn.commit()
-            counts[table] = len(rows)
+            counts[table] = migrated
         except Exception as e:
             counts[table] = f"error: {e}"
 
