@@ -131,7 +131,7 @@ def migrate_from(legacy_db_path: str, new_db_path: str) -> dict:
             if not rows:
                 counts[table] = 0
                 continue
-            columns = [c[0] for c in legacy_conn.execute(
+            columns = [c[1] for c in legacy_conn.execute(
                 f"PRAGMA table_info({table})").fetchall()]
             placeholders = ",".join(["?"] * len(columns))
             col_names = ",".join(columns)

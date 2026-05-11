@@ -29,7 +29,6 @@ def create_router(db_path: str, engine, broadcast_fn, server_config: dict):
 
     # ── Re-initialize benchmark routes with plugin deps ──
     from api.routes.benchmark import (
-        router as benchmark_router,
         init_benchmark_routes,
     )
     init_benchmark_routes(
@@ -41,14 +40,10 @@ def create_router(db_path: str, engine, broadcast_fn, server_config: dict):
         get_llamacpp=get_llamacpp_manager,
         load_config=lambda: server_config,
     )
-    # Mount benchmark endpoints
-    for route in benchmark_router.routes:
-        router.routes.append(route)
 
     # ── Re-initialize download routes with plugin deps ──
     try:
         from api.routes.downloads import (
-            router as downloads_router,
             init_download_routes,
         )
         init_download_routes(
@@ -60,10 +55,28 @@ def create_router(db_path: str, engine, broadcast_fn, server_config: dict):
             get_llamacpp=get_llamacpp_manager,
             load_config=lambda: server_config,
         )
-        for route in downloads_router.routes:
-            router.routes.append(route)
     except ImportError:
         pass
+
+    # ── Mount benchmark routes directly under plugin prefix ──
+    # These are ALSO served by the main server at /api/training, but we mount
+    # them here so the frontend can use a consistent /api/plugin/open-agc-train prefix.
+    from api.routes.benchmark import (
+        list_all_models,
+        get_benchmark_cache_status,
+        pre_download_benchmark,
+        list_benchmarks,
+        get_benchmark_detail,
+        get_checkpoint_status,
+        run_benchmark,
+    )
+    router.add_api_route("/all-models", list_all_models, methods=["GET"], tags=["benchmark"])
+    router.add_api_route("/benchmark/cache-status", get_benchmark_cache_status, methods=["GET"], tags=["benchmark"])
+    router.add_api_route("/benchmark/pre-download", pre_download_benchmark, methods=["POST"], tags=["benchmark"])
+    router.add_api_route("/benchmarks", list_benchmarks, methods=["GET"], tags=["benchmark"])
+    router.add_api_route("/benchmarks/{bench_id}", get_benchmark_detail, methods=["GET"], tags=["benchmark"])
+    router.add_api_route("/benchmark/checkpoint-status", get_checkpoint_status, methods=["GET"], tags=["benchmark"])
+    router.add_api_route("/benchmark", run_benchmark, methods=["POST"], tags=["benchmark"])
 
     # ── Plugin-specific endpoints (PPL, eval) ──
     _register_eval_endpoints(router, db_path, engine, broadcast_fn)
