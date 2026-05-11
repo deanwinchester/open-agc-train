@@ -476,6 +476,15 @@ def _register_training_endpoints(router, db_path, engine, broadcast_fn, server_c
             raise HTTPException(status_code=400, detail=f"无法执行 {action}")
         return {"status": engine.get_state()["status"]}
 
+    @router.post("/runs/{run_id}/layer-stats-toggle")
+    async def toggle_layer_stats(run_id: int):
+        state = engine.get_state()
+        if state.get("run_id") != run_id:
+            raise HTTPException(status_code=400, detail="该运行不是当前活动运行")
+        current = getattr(engine, '_layer_stats_enabled', True)
+        engine.set_layer_stats_enabled(not current)
+        return {"layer_stats_enabled": not current}
+
     # ── Datasets ──
     @router.get("/datasets")
     async def list_datasets():

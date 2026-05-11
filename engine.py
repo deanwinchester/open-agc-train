@@ -290,6 +290,23 @@ class JsonlDataset(_DatasetBase):
 
 
 
+def _build_model_tree(model):
+    """Walk a PyTorch model and return a flat list of layer descriptors for the frontend."""
+    layers = []
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        params = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        layers.append({
+            "name": name,
+            "type": module.__class__.__name__,
+            "params": params,
+            "trainable": trainable,
+        })
+    return layers
+
+
 class TrainingEngine:
     """Manages the training lifecycle with batch-level pause/step control."""
 
@@ -316,10 +333,15 @@ class TrainingEngine:
         self._training_thread = None
         self._act_stats = {"mean": 0.0, "std": 0.0, "per_layer": []}
         self._broadcast_fn = None
+        self._layer_stats_enabled = True  # can be toggled via API
 
     def set_broadcast_fn(self, fn):
         """Set the WebSocket broadcast function from server module."""
         self._broadcast_fn = fn
+
+    def set_layer_stats_enabled(self, enabled: bool):
+        """Enable/disable per-layer activation+gradient stat collection and broadcast."""
+        self._layer_stats_enabled = enabled
 
     def is_available(self) -> bool:
         return get_training_available()
@@ -565,7 +587,12 @@ class TrainingEngine:
                     model = get_peft_model(model, peft_config)
                     model.print_trainable_parameters()
 
-            # Register forward hooks for activation stats
+            # Register forward hooks for activation stats + broadcast model structure
+            self._broadcast({
+                "type": "model_structure",
+                "run_id": run_id,
+                "layers": _build_model_tree(model),
+            })
             self._register_activation_hooks(model)
 
             # Optimizer
@@ -796,11 +823,21 @@ class TrainingEngine:
                         "status": "training"
                     })
 
-                    # Record metrics
+                    # Record metrics + broadcast per-layer stats
                     if global_step % 5 == 0:
                         self._record_metrics(run_id, epoch, batch_idx, global_step,
                                              loss_val, grad_norm_val, self._state["current_lr"],
                                              act_mean, act_std)
+                        # Broadcast per-layer activation + gradient heatmap data
+                        if self._layer_stats_enabled and (self._act_buffer or self._grad_buffer):
+                            layer_stats = {
+                                "type": "layer_stats",
+                                "run_id": run_id,
+                                "step": global_step,
+                                "activations": list(self._act_buffer) if self._act_buffer else [],
+                                "gradients": list(self._grad_buffer) if self._grad_buffer else [],
+                            }
+                            self._broadcast(layer_stats)
 
                     # Step mode: pause after each batch
                     if self._step_mode:
@@ -815,8 +852,17 @@ class TrainingEngine:
                             "loss": round(loss_val, 6),
                             "grad_norm": round(grad_norm_val, 6),
                             "learning_rate": self._state["current_lr"],
-                            "act_stats": self._act_stats
+                            "act_stats": self._act_stats,
                         })
+                        # Also broadcast per-layer stats on pause
+                        if self._layer_stats_enabled and (self._act_buffer or self._grad_buffer):
+                            self._broadcast({
+                                "type": "layer_stats",
+                                "run_id": run_id,
+                                "step": global_step,
+                                "activations": list(self._act_buffer) if self._act_buffer else [],
+                                "gradients": list(self._grad_buffer) if self._grad_buffer else [],
+                            })
 
                     if max_steps > 0 and global_step >= max_steps:
                         break
@@ -914,24 +960,39 @@ class TrainingEngine:
             })
 
     def _register_activation_hooks(self, model):
-        """Register forward hooks on linear layers to capture activation stats."""
+        """Register forward + backward hooks on linear layers to capture stats."""
         self._hooks = []
         self._act_buffer = []
+        self._grad_buffer = []
 
-        def make_hook(name):
+        def make_fwd_hook(layer_name):
             def hook(module, input, output):
                 if isinstance(output, torch.Tensor):
                     self._act_buffer.append({
-                        "name": name,
-                        "mean": output.detach().float().mean().item(),
-                        "std": output.detach().float().std().item()
+                        "name": layer_name,
+                        "mean": round(output.detach().float().mean().item(), 6),
+                        "std": round(output.detach().float().std().item(), 6)
+                    })
+            return hook
+
+        def make_bwd_hook(layer_name):
+            def hook(module, grad_input, grad_output):
+                if isinstance(grad_output[0], torch.Tensor):
+                    g = grad_output[0].detach().float()
+                    self._grad_buffer.append({
+                        "name": layer_name,
+                        "grad_mean": round(g.mean().item(), 8),
+                        "grad_std": round(g.std().item(), 8),
+                        "grad_max": round(g.abs().max().item(), 8),
                     })
             return hook
 
         for name, module in model.named_modules():
             if isinstance(module, torch.nn.Linear):
-                hook = module.register_forward_hook(make_hook(name))
-                self._hooks.append(hook)
+                fwd = module.register_forward_hook(make_fwd_hook(name))
+                bwd = module.register_full_backward_hook(make_bwd_hook(name))
+                self._hooks.append(fwd)
+                self._hooks.append(bwd)
 
     def _update_run_db(self, run_id, **fields):
         """Update training_runs row from the training thread."""

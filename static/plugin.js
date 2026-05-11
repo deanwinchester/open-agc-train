@@ -426,8 +426,21 @@
         <div class="stat-display"><label>Val PPL</label><span id="monitor-val-ppl" class="stat-value" style="color:#f59e0b;font-size:1.2rem;">--</span></div>
       </div>
     </section>
-    <section class="card"><div class="card-header"><h2>逐层激活统计</h2></div>
+    <section class="card">
+      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
+        <h2>逐层统计</h2>
+        <label style="font-size:0.75rem;display:flex;align-items:center;gap:0.3rem;cursor:pointer;">
+          <input type="checkbox" id="layer-stats-toggle" checked onchange="toggleLayerStats()"> 实时热力图
+        </label>
+      </div>
       <div id="activation-stats-container"><div class="empty-state"><p>等待训练开始...</p></div></div>
+      <div id="layer-detail-panel" style="display:none;margin-top:0.5rem;padding:0.5rem;background:var(--bg-card-hover);border-radius:6px;font-size:0.75rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.3rem;">
+          <strong id="layer-detail-name"></strong>
+          <button onclick="document.getElementById('layer-detail-panel').style.display='none'" style="background:none;border:none;cursor:pointer;color:var(--text-secondary);font-size:1rem;">&times;</button>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.25rem 1rem;" id="layer-detail-grid"></div>
+      </div>
     </section>
   </div>
 </div>
@@ -1520,6 +1533,173 @@
     document.querySelectorAll('.training-deps-progress').forEach(function(el) { el.style.display = ''; });
   };
 
+  // ── Model Structure & Layer Stats ──
+  var _modelLayers = [];
+  var _layerStatsMap = {};  // name → {grad_max, act_mean, ...}
+  var _layerStatsEnabled = true;
+
+  window.toggleLayerStats = function () {
+    _layerStatsEnabled = !_layerStatsEnabled;
+    if (_activeRunId) {
+      fetch(API_BASE + '/runs/' + _activeRunId + '/layer-stats-toggle', { method: 'POST' }).catch(function () { });
+    }
+    // Reset colors when disabled
+    if (!_layerStatsEnabled) {
+      _layerStatsMap = {};
+      refreshLayerColors();
+    }
+  };
+
+  window.handleModelStructure = function (data) {
+    _modelLayers = data.layers || [];
+    _layerStatsMap = {};
+    renderModelTree();
+  };
+
+  window.handleLayerStats = function (data) {
+    var acts = data.activations || [];
+    var grads = data.gradients || [];
+    // Build lookup: pick the last entry per layer name (most recent batch)
+    var lookup = {};
+    for (var i = 0; i < acts.length; i++) {
+      var a = acts[i];
+      if (!lookup[a.name]) lookup[a.name] = {};
+      lookup[a.name].act_mean = a.mean;
+      lookup[a.name].act_std = a.std;
+    }
+    for (var j = 0; j < grads.length; j++) {
+      var g = grads[j];
+      if (!lookup[g.name]) lookup[g.name] = {};
+      lookup[g.name].grad_mean = g.grad_mean;
+      lookup[g.name].grad_std = g.grad_std;
+      lookup[g.name].grad_max = g.grad_max;
+    }
+    _layerStatsMap = lookup;
+    if (_layerStatsEnabled) refreshLayerColors();
+    // Refresh detail panel if open
+    var sel = _selectedLayerName;
+    if (sel && lookup[sel]) showLayerDetail(sel, lookup[sel]);
+  };
+
+  var _selectedLayerName = null;
+
+  function renderModelTree() {
+    var container = document.getElementById('activation-stats-container');
+    if (!container) return;
+    if (!_modelLayers.length) {
+      container.innerHTML = '<div class="empty-state"><p>等待训练开始...</p></div>';
+      return;
+    }
+    // Group by depth: count '.' in name to determine hierarchy
+    var maxGrad = 1;
+    var names = Object.keys(_layerStatsMap);
+    for (var k = 0; k < names.length; k++) {
+      var s = _layerStatsMap[names[k]];
+      if (s && s.grad_max > maxGrad) maxGrad = s.grad_max;
+    }
+
+    var html = '<div style="max-height:400px;overflow-y:auto;font-size:0.72rem;">';
+    for (var i = 0; i < _modelLayers.length; i++) {
+      var ly = _modelLayers[i];
+      var depth = ly.name.split('.').length;
+      var pad = (depth - 1) * 14;
+      var pStr = ly.params > 1e6 ? (ly.params / 1e6).toFixed(1) + 'M'
+        : ly.params > 1e3 ? (ly.params / 1e3).toFixed(1) + 'K'
+        : ly.params > 0 ? ly.params : '';
+      var stat = _layerStatsMap[ly.name];
+      var bgColor = 'transparent';
+      if (stat && stat.grad_max != null && _layerStatsEnabled) {
+        var ratio = Math.min(stat.grad_max / Math.max(maxGrad, 1e-12), 1);
+        bgColor = gradientColor(ratio);
+      }
+      html += '<div class="layer-row" data-layer="' + ly.name
+        + '" style="display:flex;align-items:center;padding:3px 6px;padding-left:'
+        + (pad + 6) + 'px;cursor:pointer;background:' + bgColor
+        + ';border-radius:3px;margin:1px 0;transition:background 0.3s;font-family:monospace;"'
+        + ' onclick="showLayerDetail(\'' + ly.name + '\')"'
+        + ' title="' + ly.name + ' | ' + ly.type + (pStr ? ' | ' + pStr : '') + '">'
+        + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
+        + ly.name.split('.').pop() + '</span>'
+        + '<span style="color:var(--text-secondary);font-size:0.65rem;opacity:0.6;margin-left:0.4rem;">'
+        + ly.type + '</span>'
+        + (pStr ? '<span style="color:var(--theme-color);font-size:0.65rem;opacity:0.7;margin-left:0.4rem;">'
+        + pStr + '</span>' : '')
+        + '</div>';
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  }
+
+  function refreshLayerColors() {
+    var maxGrad = 1;
+    var names = Object.keys(_layerStatsMap);
+    for (var k = 0; k < names.length; k++) {
+      var s = _layerStatsMap[names[k]];
+      if (s && s.grad_max > maxGrad) maxGrad = s.grad_max;
+    }
+    var rows = document.querySelectorAll('.layer-row');
+    for (var r = 0; r < rows.length; r++) {
+      var row = rows[r];
+      var name = row.dataset.layer;
+      var stat = _layerStatsMap[name];
+      if (stat && stat.grad_max != null && _layerStatsEnabled) {
+        var ratio = Math.min(stat.grad_max / Math.max(maxGrad, 1e-12), 1);
+        row.style.background = gradientColor(ratio);
+      } else {
+        row.style.background = 'transparent';
+      }
+    }
+  }
+
+  function gradientColor(ratio) {
+    // Blue (cold) → White → Red (hot)
+    var r, g, b;
+    if (ratio < 0.5) {
+      var t = ratio * 2; // 0→1
+      r = Math.round(30 + t * 225);   // 30→255
+      g = Math.round(144 + t * 111);  // 144→255
+      b = Math.round(255);            // 255→255
+    } else {
+      var t = (ratio - 0.5) * 2; // 0→1
+      r = Math.round(255);            // 255→255
+      g = Math.round(255 - t * 210);  // 255→45
+      b = Math.round(255 - t * 255);  // 255→0
+    }
+    return 'rgba(' + r + ',' + g + ',' + b + ',0.35)';
+  }
+
+  window.showLayerDetail = showLayerDetail;
+  function showLayerDetail(name, statOverride) {
+    _selectedLayerName = name;
+    var panel = document.getElementById('layer-detail-panel');
+    var nameEl = document.getElementById('layer-detail-name');
+    var grid = document.getElementById('layer-detail-grid');
+    if (!panel || !nameEl || !grid) return;
+    panel.style.display = '';
+    nameEl.textContent = name;
+
+    var stat = statOverride || _layerStatsMap[name] || {};
+    var ly = _modelLayers.find(function (x) { return x.name === name; }) || {};
+    var pStr = ly.params > 1e6 ? (ly.params / 1e6).toFixed(2) + 'M'
+      : ly.params > 1e3 ? (ly.params / 1e3).toFixed(1) + 'K'
+      : ly.params || '0';
+
+    grid.innerHTML =
+      '<div>类型:</div><div style="font-weight:600;">' + (ly.type || '?') + '</div>'
+      + '<div>参数量:</div><div style="font-weight:600;">' + pStr + '</div>'
+      + '<div>可训练:</div><div style="font-weight:600;">' + (ly.trainable ? '是' : '否') + '</div>'
+      + '<div style="grid-column:1/-1;margin-top:0.25rem;border-top:1px solid var(--border-color);padding-top:0.25rem;"></div>'
+      + '<div>激活均值:</div><div>' + (stat.act_mean != null ? stat.act_mean.toExponential(3) : '--') + '</div>'
+      + '<div>激活标准差:</div><div>' + (stat.act_std != null ? stat.act_std.toExponential(3) : '--') + '</div>'
+      + '<div>梯度均值:</div><div>' + (stat.grad_mean != null ? stat.grad_mean.toExponential(3) : '--') + '</div>'
+      + '<div>梯度标准差:</div><div>' + (stat.grad_std != null ? stat.grad_std.toExponential(3) : '--') + '</div>'
+      + '<div>梯度最大值:</div><div style="color:#e74c3c;font-weight:600;">'
+      + (stat.grad_max != null ? stat.grad_max.toExponential(3) : '--') + '</div>'
+      + '<div style="grid-column:1/-1;margin-top:0.3rem;height:6px;border-radius:3px;background:'
+      + (stat.grad_max != null ? gradientColor(Math.min(stat.grad_max / 0.01, 1)) : '#eee')
+      + ';"></div>';
+  }
+
   window.handleBenchmarkProgress = function (data) {
     var progContainer = document.getElementById('benchmark-progress-container');
     if (!progContainer) return;
@@ -2056,7 +2236,7 @@
   // Register WebSocket message types so main app doesn't switch to chat
   var msgTypes = ['training_progress', 'training_complete', 'training_error',
     'training_step_paused', 'benchmark_progress', 'benchmark_complete',
-    'install_progress'];
+    'install_progress', 'model_structure', 'layer_stats'];
   msgTypes.forEach(function(t) {
     if (window.registerWsMessageType) window.registerWsMessageType(t);
   });
@@ -2078,6 +2258,8 @@
       else if (type === 'training_complete') { window.handleTrainingComplete(data); }
       else if (type === 'training_error') { window.handleTrainingError(data); }
       else if (type === 'training_step_paused') { window.handleTrainingStepPaused(data); }
+      else if (type === 'model_structure') { window.handleModelStructure(data); }
+      else if (type === 'layer_stats') { window.handleLayerStats(data); }
       else if (type === 'benchmark_progress') { window.handleBenchmarkProgress(data); }
       else if (type === 'benchmark_complete' || type === 'benchmark_error') {
         if (type === 'benchmark_error') showStatus('测评出错', 'error');
