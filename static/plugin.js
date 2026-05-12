@@ -2278,7 +2278,6 @@
   });
 
   // Listen for WebSocket messages from the main app connection
-  showStatus('插件初始化, addWsListener=' + (typeof window.addWsListener), '');
   if (window.addWsListener) {
     var _firstProgressToast = true;
     window.addWsListener(function(data) {
