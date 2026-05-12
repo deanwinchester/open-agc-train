@@ -206,6 +206,7 @@ class TokenChunkDataset(_DatasetBase):
                                start + batch_size >= len(texts)):
                 progress_cb(start / max(len(texts), 1),
                            f"分词中: {start}/{len(texts)} 条 ({total_chars/1e6:.1f}M 字符)")
+                print(f"[Dataset] Tokenizing {start}/{len(texts)} ({total_chars/1e6:.1f}M chars)")
 
         tokenizer.model_max_length = old_max  # restore
 
@@ -472,10 +473,10 @@ class TrainingEngine:
                 import json
                 params = json.loads(params)
 
-            epochs = params.get("epochs", 3)
+            epochs = params.get("num_epochs", params.get("epochs", 3))
             batch_size = params.get("batch_size", 4)
             learning_rate = params.get("learning_rate", 2e-4)
-            grad_accum = params.get("gradient_accumulation", 1)
+            grad_accum = params.get("gradient_accumulation", params.get("gradient_accumulation_steps", 1))
             max_steps = params.get("max_steps", -1)
             optimizer_name = params.get("optimizer", "adamw")
             weight_decay = params.get("weight_decay", 0.01)
@@ -575,14 +576,24 @@ class TrainingEngine:
 
                 # Apply LoRA
                 lora_config = params.get("lora", {})
+                if not lora_config and "lora_r" in params:
+                    lora_config = {
+                        "rank": params.get("lora_r", 8),
+                        "alpha": params.get("lora_alpha", 16),
+                        "dropout": params.get("lora_dropout", 0.05),
+                        "target_modules": params.get("lora_target_modules", "q_proj, v_proj"),
+                    }
                 if lora_config:
                     from peft import LoraConfig, get_peft_model, TaskType
+                    targets = lora_config.get("target_modules", ["q_proj", "v_proj"])
+                    if isinstance(targets, str):
+                        targets = [t.strip() for t in targets.split(",")]
                     peft_config = LoraConfig(
                         task_type=TaskType.CAUSAL_LM,
                         r=lora_config.get("rank", 8),
                         lora_alpha=lora_config.get("alpha", 16),
                         lora_dropout=lora_config.get("dropout", 0.05),
-                        target_modules=lora_config.get("target_modules", ["q_proj", "v_proj"]),
+                        target_modules=targets,
                     )
                     model = get_peft_model(model, peft_config)
                     model.print_trainable_parameters()

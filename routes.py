@@ -118,6 +118,9 @@ def _register_eval_endpoints(router, db_path, engine, broadcast_fn):
         max_length: int = 1024
         dataset_id: Optional[int] = None
 
+    # Track eval job status: run_id → {status: "running"|"done"|"error", message: str}
+    _eval_jobs = {}
+
     @router.post("/runs/{run_id}/eval-ppl")
     async def eval_model_ppl(run_id: int, req: EvalPPLRequest):
         conn = sqlite3.connect(db_path)
@@ -147,13 +150,19 @@ def _register_eval_endpoints(router, db_path, engine, broadcast_fn):
             if ds and ds["storage_path"]:
                 dataset_path = ds["storage_path"]
 
-        result_holder = {}
+        _eval_jobs[run_id] = {"status": "running", "message": "评估中...", "progress": 0, "label": "准备中..."}
 
         def run_eval():
             try:
                 from .eval import compute_ppl
+                def progress_cb(ratio, label):
+                    _eval_jobs[run_id] = {"status": "running", "progress": round(ratio, 3), "label": label}
+                    if broadcast_fn:
+                        broadcast_fn({"type": "eval_progress", "run_id": run_id,
+                                       "progress": ratio, "label": label})
                 kwargs = {"model_path": save_dir, "max_samples": req.max_samples,
-                          "stride": req.stride, "max_length": req.max_length}
+                          "stride": req.stride, "max_length": req.max_length,
+                          "progress_cb": progress_cb}
                 if dataset_path and os.path.exists(dataset_path):
                     kwargs["dataset_path"] = dataset_path
                 result = compute_ppl(**kwargs)
@@ -164,15 +173,25 @@ def _register_eval_endpoints(router, db_path, engine, broadcast_fn):
                      json.dumps(result, ensure_ascii=False), result.get("num_windows", 0),
                      result.get("eval_time_seconds", 0) * 1000, 0))
                 conn3.commit(); conn3.close()
-                result_holder["result"] = result
+                _eval_jobs[run_id] = {"status": "done", "ppl": result.get("ppl")}
             except Exception as e:
-                result_holder["error"] = str(e)
+                _eval_jobs[run_id] = {"status": "error", "message": str(e)}
 
         threading.Thread(target=run_eval, daemon=True).start()
         return {"status": "started", "message": f"开始 PPL 评估 (run_{run_id})..."}
 
     @router.get("/runs/{run_id}/eval-ppl")
     async def get_eval_ppl_result(run_id: int):
+        # Check in-memory job status first
+        job = _eval_jobs.get(run_id)
+        if job:
+            if job["status"] == "error":
+                raise HTTPException(status_code=500, detail=f"PPL 评估失败: {job.get('message', '未知错误')}")
+            if job["status"] == "running":
+                return {"status": "running", "ppl": None,
+                        "progress": job.get("progress", 0),
+                        "label": job.get("label", "评估中...")}
+        # Check DB for completed results
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -182,9 +201,10 @@ def _register_eval_endpoints(router, db_path, engine, broadcast_fn):
         row = cursor.fetchone()
         conn.close()
         if not row:
-            raise HTTPException(status_code=404, detail="未找到 PPL 评估结果")
+            return {"status": "idle", "ppl": None}
         d = dict(row)
         d["metrics_json"] = json.loads(d["metrics_json"]) if isinstance(d["metrics_json"], str) else d["metrics_json"]
+        d["status"] = "done"
         return d
 
     class EvalMetricsRequest(BaseModel):

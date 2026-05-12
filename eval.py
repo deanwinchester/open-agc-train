@@ -192,40 +192,32 @@ def _compute_ppl_local(model_path, texts, max_samples, stride, max_length,
 
 def _compute_ppl_via_api(model_id, texts, max_samples, stride, max_length,
                          progress_cb, t_start):
-    """Approximate PPL via LLMClient API calls (token-level logprobs)."""
-    # This is an approximation — API models may not return full logprobs.
-    # We use a simplified approach: compute per-token cross-entropy from
-    # the API logprobs if available, otherwise fall back to a heuristic.
+    """Approximate PPL via LLMClient API calls (token-level logprobs).
+
+    Most API models don't expose logprobs needed for true PPL.
+    This is a best-effort approximation using completion APIs.
+    """
     try:
-        try:
-    from core.llm_client import LLMClient
-except ImportError:
-    LLMClient = None
+        from core.llm_client import LLMClient
     except ImportError:
+        LLMClient = None
+
+    if LLMClient is None:
         raise Exception("LLMClient 不可用")
 
     client = LLMClient(default_model=model_id)
     full_text = "\n\n".join(texts[:max_samples])
-    words = full_text.split()
-    total_loss = 0.0
-    total_tokens = 0
-
-    # For API models, we use a simpler approach: ask the model to score
-    # text sequences and estimate PPL from the loss-like signal
-    chunk_size = 256
-    chunks = [full_text[i:i+chunk_size] for i in range(0, min(len(full_text), chunk_size * 100), chunk_size)]
+    chunks = [full_text[i:i+256] for i in range(0, min(len(full_text), 25600), 256)]
 
     if progress_cb:
         progress_cb(0.10, f"通过 API 评估 ({len(chunks)} chunks)...")
 
-    # Note: Most API models don't expose logprobs needed for true PPL.
-    # This is a best-effort approximation using completion APIs.
+    total_tokens = 0
     for idx, chunk in enumerate(chunks):
         try:
             response, _ = client.chat(messages=[
                 {"role": "user", "content": f"Continue the following text exactly as is, without adding anything:\n\n{chunk}"}
             ])
-            # Heuristic: compare response length with expected
             if response and hasattr(response, "usage"):
                 usage = response.usage
                 total_tokens += usage.total_tokens if usage else 0
@@ -235,9 +227,8 @@ except ImportError:
             progress_cb(0.10 + 0.80 * (idx / len(chunks)), f"API评估 {idx}/{len(chunks)}")
 
     elapsed = time.time() - t_start
-    # This is a rough approximation; flag it as such
     return {
-        "ppl": None,  # Cannot compute true PPL via API
+        "ppl": None,
         "avg_nll": None,
         "num_windows": len(chunks),
         "total_tokens_processed": total_tokens,

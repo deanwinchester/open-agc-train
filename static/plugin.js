@@ -850,8 +850,8 @@
         container.innerHTML = '<div class="empty-state"><p>暂无训练记录</p></div>';
         return;
       }
-      var statusIcon = { running: '⏳', paused: '⏸️', completed: '✅', failed: '❌', aborted: '⏹', pending: '📋' };
-      var statusText = { running: '训练中', paused: '已暂停', completed: '已完成', failed: '失败', aborted: '已中止', pending: '等待中' };
+      var statusIcon = { running: '⏳', paused: '⏸️', completed: '✅', failed: '❌', aborted: '⏹', aborted_saved: '💾', pending: '📋' };
+      var statusText = { running: '训练中', paused: '已暂停', completed: '已完成', failed: '失败', aborted: '已中止', aborted_saved: '中止并保存', pending: '等待中' };
       container.innerHTML = runs.map(function(r) {
         var icon = statusIcon[r.status] || '📋';
         var text = statusText[r.status] || r.status;
@@ -866,12 +866,16 @@
           + (r.checkpoint_dir ? '<br><span style="opacity:0.8;font-size:0.7rem;">📍 ' + escapeHtml(r.checkpoint_dir) + '</span>' : '')
           + '</div></div>'
           + '<div style="display:flex;gap:0.3rem;align-items:center;">'
-          + (r.status === 'completed'
+          + (r.status === 'completed' || r.status === 'aborted_saved'
             ? '<button class="btn-secondary test-run-btn" data-id="' + r.id + '" style="font-size:0.7rem;padding:0.2rem 0.4rem;color:var(--theme-color);">对话测试</button>'
             + '<button class="btn-secondary eval-ppl-btn" data-id="' + r.id + '" style="font-size:0.7rem;padding:0.2rem 0.4rem;color:#f59e0b;">PPL</button>'
             : '')
           + '<button class="btn-secondary delete-run-btn" data-id="' + r.id + '" style="font-size:0.7rem;padding:0.2rem 0.4rem;color:var(--error);">删除</button>'
-          + '</div></div>';
+          + '</div></div>'
+          + '<div class="eval-progress-row" id="eval-progress-' + r.id + '" style="display:none;margin-top:0.3rem;margin-bottom:0.5rem;padding:0.3rem 0.5rem;background:var(--bg-card-hover);border-radius:4px;font-size:0.72rem;">'
+          + '<div style="display:flex;justify-content:space-between;"><span class="eval-progress-label">PPL 评估中...</span><span class="eval-progress-pct">0%</span></div>'
+          + '<div style="height:4px;background:var(--border-color);border-radius:2px;margin-top:0.2rem;"><div class="eval-progress-bar" style="width:0%;height:100%;background:#f59e0b;border-radius:2px;transition:width 0.3s;"></div></div>'
+          + '</div>';
       }).join('');
     }).catch(function() {});
   };
@@ -1240,18 +1244,35 @@
     var attempts = 0;
     function poll() {
       attempts++;
-      if (attempts > 120) { btn.disabled = false; btn.textContent = 'PPL'; showStatus('⚠️ PPL 评估超时', 'error'); return; }
+      if (attempts > 120) { btn.disabled = false; btn.textContent = 'PPL'; showStatus('PPL 评估超时', 'error'); return; }
       setTimeout(function() {
         fetch(API_BASE + '/runs/' + runId + '/eval-ppl').then(function(r) {
-          if (!r.ok) { poll(); return; }
+          if (!r.ok) {
+            // Server error — might be transient
+            if (r.status >= 500) { btn.disabled = false; btn.textContent = 'PPL'; showStatus('PPL 评估失败', 'error'); return; }
+            poll(); return;
+          }
           return r.json();
         }).then(function(d) {
-          var m = d && d.metrics_json;
-          if (m && m.ppl !== undefined) {
-            var pplColor = m.ppl < 20 ? 'var(--success)' : m.ppl < 60 ? '#f59e0b' : 'var(--error)';
-            var pplLevel = m.ppl < 15 ? '优秀' : m.ppl < 30 ? '良好' : m.ppl < 60 ? '一般' : '较差';
-            showStatus('📊 PPL: <b style="color:' + pplColor + '">' + m.ppl.toFixed(2) + '</b> (' + pplLevel + ')', 'success');
-            btn.disabled = false;
+          if (!d) { poll(); return; }
+          if (d.status === 'running' || d.status === 'idle') { poll(); return; }
+          if (d.status === 'done') {
+            var m = d.metrics_json;
+            if (m && m.ppl !== undefined) {
+              var pplColor = m.ppl < 20 ? 'var(--success)' : m.ppl < 60 ? '#f59e0b' : 'var(--error)';
+              var pplLevel = m.ppl < 15 ? '优秀' : m.ppl < 30 ? '良好' : m.ppl < 60 ? '一般' : '较差';
+              var row = document.getElementById('eval-progress-' + runId);
+              if (row) {
+                row.style.display = '';
+                var label = row.querySelector('.eval-progress-label');
+                var pctEl = row.querySelector('.eval-progress-pct');
+                var bar = row.querySelector('.eval-progress-bar');
+                if (label) label.innerHTML = 'PPL: <b style=\"color:' + pplColor + '\">' + m.ppl.toFixed(2) + '</b> (' + pplLevel + ')';
+                if (pctEl) pctEl.textContent = '';
+                if (bar) bar.style.width = '100%';
+              }
+              btn.disabled = false;
+            } else { poll(); }
           } else { poll(); }
         }).catch(function() { poll(); });
       }, 2000);
@@ -1531,6 +1552,19 @@
     document.querySelectorAll('.training-deps-label').forEach(function(el) { el.textContent = data.label || ''; });
     document.querySelectorAll('.training-deps-bar').forEach(function(el) { el.style.width = (data.progress || 0) + '%'; });
     document.querySelectorAll('.training-deps-progress').forEach(function(el) { el.style.display = ''; });
+  };
+
+  window.handleEvalProgress = function (data) {
+    var row = document.getElementById('eval-progress-' + data.run_id);
+    if (!row) return;
+    row.style.display = '';
+    var pct = Math.round(data.progress * 100);
+    var label = row.querySelector('.eval-progress-label');
+    var pctEl = row.querySelector('.eval-progress-pct');
+    var bar = row.querySelector('.eval-progress-bar');
+    if (label) label.textContent = data.label || 'PPL 评估中...';
+    if (pctEl) pctEl.textContent = pct + '%';
+    if (bar) bar.style.width = pct + '%';
   };
 
   // ── Model Structure & Layer Stats ──
@@ -2171,8 +2205,10 @@
           body: JSON.stringify({})
         }).then(function(r) { return r.json(); }).then(function(d) {
           if (d.status === 'started') {
-            showStatus('📊 ' + d.message, 'success');
             btn.textContent = 'PPL';
+            // Show inline progress bar
+            var row = document.getElementById('eval-progress-' + runId);
+            if (row) { row.style.display = ''; row.querySelector('.eval-progress-bar').style.width = '0%'; }
             pollPPLResult(runId, btn);
           } else {
             btn.disabled = false;
@@ -2236,7 +2272,7 @@
   // Register WebSocket message types so main app doesn't switch to chat
   var msgTypes = ['training_progress', 'training_complete', 'training_error',
     'training_step_paused', 'benchmark_progress', 'benchmark_complete',
-    'install_progress', 'model_structure', 'layer_stats'];
+    'install_progress', 'model_structure', 'layer_stats', 'eval_progress'];
   msgTypes.forEach(function(t) {
     if (window.registerWsMessageType) window.registerWsMessageType(t);
   });
@@ -2266,6 +2302,7 @@
         window.handleBenchmarkComplete(data);
       }
       else if (type === 'install_progress') { window.handleInstallProgress(data); }
+      else if (type === 'eval_progress') { window.handleEvalProgress(data); }
     });
   }
 
