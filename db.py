@@ -136,10 +136,11 @@ def _add_column(conn, table, column, col_def):
 def migrate_from(legacy_db_path: str, new_db_path: str) -> dict:
     """Copy training data from legacy chat_history.db into the new training.db.
 
-    Returns counts of migrated rows per table.
+    After a successful migration, the legacy tables are dropped so the
+    migration only runs once. Returns counts of migrated rows per table.
     """
     if not os.path.exists(legacy_db_path):
-        return {"error": f"Legacy DB not found: {legacy_db_path}"}
+        return None
 
     new_conn = init_db(new_db_path)
     legacy_conn = sqlite3.connect(legacy_db_path)
@@ -148,9 +149,18 @@ def migrate_from(legacy_db_path: str, new_db_path: str) -> dict:
     counts = {}
     tables = ["model_configs", "datasets", "training_runs",
               "training_metrics", "benchmark_results", "downloads"]
+    any_migrated = False
 
     for table in tables:
         try:
+            # Check if legacy table exists
+            tbl_check = legacy_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone()
+            if not tbl_check:
+                counts[table] = 0
+                continue
+
             rows = legacy_conn.execute(f"SELECT * FROM {table}").fetchall()
             if not rows:
                 counts[table] = 0
@@ -177,9 +187,20 @@ def migrate_from(legacy_db_path: str, new_db_path: str) -> dict:
                     pass
             new_conn.commit()
             counts[table] = migrated
+            any_migrated = True
+
+            # Drop the legacy table after successful migration
+            if migrated > 0:
+                try:
+                    legacy_conn.execute(f"DROP TABLE {table}")
+                    legacy_conn.commit()
+                except Exception:
+                    pass
         except Exception as e:
             counts[table] = f"error: {e}"
 
     legacy_conn.close()
     new_conn.close()
-    return counts
+
+    # Return counts only if something was actually migrated
+    return counts if any_migrated else None
